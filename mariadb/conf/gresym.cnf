@@ -1,0 +1,9 @@
+# Mounted into /etc/mysql/conf.d. Matches the database created natively: utf8mb4 / utf8mb4_general_ci
+# (case-insensitive comparisons; MariaDB 11.8 would otherwise default to uca1400 for new tables).
+[mariadb]
+character-set-server = utf8mb4
+collation-server = utf8mb4_general_ci
+character_set_collations = utf8mb4=utf8mb4_general_ci
+
+[client]
+default-character-set = utf8mb4
