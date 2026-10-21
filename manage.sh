@@ -19,8 +19,23 @@ MILVUS_IMAGE="milvusdb/milvus:v3.0.2"
 command -v docker >/dev/null || { echo "docker не установлен"; exit 1; }
 command -v jq >/dev/null || { echo "jq не установлен"; exit 1; }
 
+# Индексы PyTorch для TORCH_BACKEND (сборка образа ML). cpu берётся из uv.lock (индекс pytorch-cpu в ml/pyproject.toml)
+declare -A TORCH_INDEXES=(
+    [rocm]="https://download.pytorch.org/whl/nightly/rocm10.1"
+    [cuda]="https://download.pytorch.org/whl/nightly/cu134"
+)
+
+# docker compose с GPU-оверлеем для TORCH_BACKEND=rocm|cuda (compose.rocm.yaml / compose.cuda.yaml).
+# Явный -f отключает автозагрузку compose.override.yaml, поэтому он добавляется вручную
 compose() {
-    docker compose "$@"
+    local files=(-f compose.yaml)
+    local backend
+    backend=$(env_value TORCH_BACKEND)
+    if [[ -n "$backend" && "$backend" != "cpu" ]]; then
+        files+=(-f "compose.$backend.yaml")
+    fi
+    [[ -f compose.override.yaml ]] && files+=(-f compose.override.yaml)
+    docker compose "${files[@]}" "$@"
 }
 
 is_placeholder() {
@@ -95,10 +110,44 @@ setup() {
         echo "Внимание: port в $BACKEND_CONFIG = ${values[DB_PORT]}, контейнер MariaDB будет опубликован на этом порту"
     fi
 
+    # Сборка PyTorch: TORCH_BACKEND=rocm ./manage.sh setup, иначе остаётся значение из .env (по умолчанию cpu)
+    values[TORCH_BACKEND]="${TORCH_BACKEND:-$(env_value TORCH_BACKEND)}"
+    values[TORCH_BACKEND]="${values[TORCH_BACKEND]:-cpu}"
+    case "${values[TORCH_BACKEND]}" in
+        cpu|rocm|cuda) ;;
+        *) echo "Ошибка: TORCH_BACKEND=${values[TORCH_BACKEND]}, ожидается cpu, rocm или cuda"; exit 1 ;;
+    esac
+    # Индекс можно переопределить (TORCH_INDEX_URL=... ./manage.sh setup), пока backend не меняется
+    local previous_backend
+    previous_backend=$(env_value TORCH_BACKEND)
+    values[TORCH_INDEX_URL]="${TORCH_INDEX_URL:-}"
+    if [[ -z "${values[TORCH_INDEX_URL]}" && "$previous_backend" == "${values[TORCH_BACKEND]}" ]]; then
+        values[TORCH_INDEX_URL]=$(env_value TORCH_INDEX_URL)
+    fi
+    [[ "${values[TORCH_BACKEND]}" == "cpu" ]] && values[TORCH_INDEX_URL]=""
+    [[ "${values[TORCH_BACKEND]}" != "cpu" && -z "${values[TORCH_INDEX_URL]}" ]] && values[TORCH_INDEX_URL]="${TORCH_INDEXES[${values[TORCH_BACKEND]}]}"
+    values[ML_MODEL_DTYPE]="${ML_MODEL_DTYPE:-$(env_value ML_MODEL_DTYPE)}"
+    values[ML_MODEL_DTYPE]="${values[ML_MODEL_DTYPE]:-bfloat16}"
+    # ROCm: контейнеру нужны группы video и render хоста (доступ к /dev/kfd и /dev/dri)
+    values[VIDEO_GID]=$(getent group video | cut -d: -f3)
+    values[RENDER_GID]=$(getent group render | cut -d: -f3)
+    if [[ "${values[TORCH_BACKEND]}" == "rocm" ]]; then
+        if [[ -z "${values[VIDEO_GID]}" || -z "${values[RENDER_GID]}" ]]; then
+            echo "Ошибка: на хосте нет группы video или render (нужны для ROCm)"
+            exit 1
+        fi
+        [[ -e /dev/kfd ]] || echo "Внимание: /dev/kfd не найден, драйвер amdgpu не загружен?"
+    fi
+    if [[ "${values[TORCH_BACKEND]}" != "$previous_backend" && -n "$previous_backend" ]]; then
+        echo "TORCH_BACKEND: $previous_backend → ${values[TORCH_BACKEND]}. Пересоберите образ ML: ./manage.sh up --app"
+    fi
+    echo "PyTorch: ${values[TORCH_BACKEND]}${values[TORCH_INDEX_URL]:+ (${values[TORCH_INDEX_URL]})}"
+
     values[API_DB_CONNECTION]="Server=mariadb;Port=3306;Database=${values[DB_NAME]};User=$(quote_conn_value "${values[DB_USER]}");Password=$(quote_conn_value "${values[DB_PASSWORD]}");"
 
     local order=(MARIADB_ROOT_PASSWORD DB_NAME DB_PORT DB_USER DB_PASSWORD DB_READONLY_USER DB_READONLY_PASSWORD
-                 RABBITMQ_USER RABBITMQ_PASSWORD JWT_KEY JWT_EXPIRE_MINUTES API_DB_CONNECTION)
+                 RABBITMQ_USER RABBITMQ_PASSWORD JWT_KEY JWT_EXPIRE_MINUTES API_DB_CONNECTION
+                 TORCH_BACKEND TORCH_INDEX_URL ML_MODEL_DTYPE VIDEO_GID RENDER_GID)
     for key in "${order[@]}"; do
         if [[ "${values[$key]}" == *"'"* || "${values[$key]}" == *$'\n'* ]]; then
             echo "Ошибка: значение $key содержит одинарную кавычку или перевод строки, в .env так нельзя"
@@ -287,6 +336,7 @@ case "${1:-}" in
     *)
         echo "Использование: $0 {setup|up|down|ps|logs|backup|restore|milvus-snapshot}"
         echo "  setup                       — сгенерировать .env из ../backend/config.json и ../ml/config.json"
+        echo "                                (TORCH_BACKEND=cpu|rocm|cuda ./manage.sh setup — сборка PyTorch для ML)"
         echo "  up [--app]                  — запустить MariaDB, RabbitMQ, Milvus (--app: ещё API, ML API, ML worker)"
         echo "  down                        — остановить и удалить контейнеры (данные в data/ остаются)"
         echo "  ps | logs [сервис]          — состояние / логи"

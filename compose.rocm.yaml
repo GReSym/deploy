@@ -1,0 +1,18 @@
+# AMD GPU (ROCm) for the ML worker. Loaded by manage.sh when TORCH_BACKEND=rocm (deploy/.env).
+# Host needs the amdgpu kernel driver (/dev/kfd, /dev/dri); the ROCm user-space comes with the torch wheel.
+# Group ids are the host's video/render groups (written to .env by ./manage.sh setup).
+services:
+  ml-worker:
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${VIDEO_GID:?run ./manage.sh setup}"
+      - "${RENDER_GID:?run ./manage.sh setup}"
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      GRESYM_ML__MODEL__DEVICE: cuda  # ROCm builds of torch expose AMD GPUs through the cuda API
+      GRESYM_ML__MODEL__DTYPE: ${ML_MODEL_DTYPE:-bfloat16}
+# A GPU that ROCm doesn't support officially may need HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0). Set it in
+# compose.override.yaml (services.ml-worker.environment), not here: an empty value breaks the ROCm runtime.

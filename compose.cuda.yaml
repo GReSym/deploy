@@ -1,0 +1,14 @@
+# NVIDIA GPU (CUDA) for the ML worker. Loaded by manage.sh when TORCH_BACKEND=cuda (deploy/.env).
+# Host needs the NVIDIA driver and nvidia-container-toolkit (`nvidia-ctk runtime configure --runtime=docker`).
+services:
+  ml-worker:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      GRESYM_ML__MODEL__DEVICE: cuda
+      GRESYM_ML__MODEL__DTYPE: ${ML_MODEL_DTYPE:-bfloat16}

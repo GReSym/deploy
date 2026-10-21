@@ -73,6 +73,26 @@ GReSym/
 
 Конфигурация Milvus — `milvus/embedEtcd.yaml` и `milvus/user.yaml` (переопределения `milvus.yaml`). После изменения: `docker compose restart milvus`.
 
+### GPU (ROCm / CUDA)
+
+По умолчанию ML-образ собирается с CPU-версией PyTorch. Для видеокарты:
+
+```bash
+TORCH_BACKEND=rocm ./manage.sh setup    # или cuda; обратно: TORCH_BACKEND=cpu
+./manage.sh up --app                    # пересоберёт образ ML с torch из nightly-индекса PyTorch
+./manage.sh logs ml-worker              # в строке "Loading ... on cuda" видно, что модель на GPU
+```
+
+GPU получает только `ml-worker` (`compose.rocm.yaml` / `compose.cuda.yaml`). `manage.sh` подключает эти файлы сам,
+поэтому запускайте сервисы через него: обычный `docker compose up` запустит worker без GPU.
+
+- ROCm: нужен драйвер amdgpu (`/dev/kfd`, `/dev/dri`). Группы video/render хоста `setup` записывает в `.env`.
+  Если ROCm официально не поддерживает видеокарту, добавьте `HSA_OVERRIDE_GFX_VERSION` (например `11.0.0`)
+  в `compose.override.yaml`, в раздел `services.ml-worker.environment`.
+- CUDA: нужны драйвер NVIDIA и `nvidia-container-toolkit` (`sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`).
+- Тип данных модели на GPU — `ML_MODEL_DTYPE` в `.env` (`bfloat16` по умолчанию; для старых видеокарт `float16` или `float32`).
+- Другой индекс PyTorch: `TORCH_INDEX_URL=... TORCH_BACKEND=rocm ./manage.sh setup`.
+
 ### RabbitMQ
 
 Топологию (`gresym.tasks`, `gresym.dlx`, quorum-очереди `ml.vectorize-game[.dlq]`) объявляют API и ML worker при подключении,
