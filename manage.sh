@@ -21,8 +21,8 @@ command -v jq >/dev/null || { echo "jq не установлен"; exit 1; }
 
 # Индексы PyTorch для TORCH_BACKEND (сборка образа ML). cpu берётся из uv.lock (индекс pytorch-cpu в ml/pyproject.toml)
 declare -A TORCH_INDEXES=(
-    [rocm]="https://download.pytorch.org/whl/nightly/rocm10.1"
-    [cuda]="https://download.pytorch.org/whl/nightly/cu134"
+    [rocm]="https://download.pytorch.org/whl/rocm7.14"
+    [cuda]="https://download.pytorch.org/whl/cu132"
 )
 
 # docker compose с GPU-оверлеем для TORCH_BACKEND=rocm|cuda (compose.rocm.yaml / compose.cuda.yaml).
