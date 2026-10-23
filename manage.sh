@@ -278,7 +278,7 @@ restore() {
     esac
 }
 
-# Точная копия data/milvus (только для той же версии Milvus). Milvus на время копирования останавливается.
+# Точная копия data/milvus (только для той же версии Milvus). Milvus и etcd на время копирования останавливаются.
 # Файлы принадлежат пользователю контейнера, поэтому tar запускается внутри образа Milvus от root
 milvus_snapshot() {
     require_docker
@@ -286,8 +286,8 @@ milvus_snapshot() {
     local target="${1:-$BACKUPS_DIR/milvus-snapshot-$(date +%Y%m%dT%H%M).tar.zst}"
     [[ -e "$target" ]] && { echo "Ошибка: $target уже существует"; exit 1; }
     mkdir -p "$(dirname "$target")"
-    echo "Останавливаем Milvus"
-    compose stop milvus || exit 1
+    echo "Останавливаем Milvus и etcd"
+    compose stop milvus etcd || exit 1
     echo "Снимок data/milvus → $target"
     if docker run --rm --user 0:0 --network none --entrypoint tar \
             -v "$DEPLOY_DIR/data/milvus:/src:ro" "$MILVUS_IMAGE" \
@@ -311,8 +311,8 @@ milvus_snapshot_restore() {
         [[ "$answer" =~ ^[YyДд]$ ]] || { echo "Отменено"; exit 1; }
     fi
     prepare_dirs
-    echo "Останавливаем Milvus"
-    compose stop milvus || exit 1
+    echo "Останавливаем Milvus и etcd"
+    compose stop milvus etcd || exit 1
     if zstd -q -dc "$file" | docker run --rm -i --user 0:0 --network none --entrypoint /bin/sh \
             -v "$DEPLOY_DIR/data/milvus:/dst" "$MILVUS_IMAGE" \
             -c 'find /dst -mindepth 1 -delete && tar --numeric-owner -C /dst -xpf -'; then
@@ -344,7 +344,7 @@ case "${1:-}" in
         echo "  restore mariadb <файл> [--yes]          — восстановить MariaDB из дампа"
         echo "  restore milvus <файл.npz> [--yes]       — восстановить векторы из ml export"
         echo "  restore milvus-snapshot <файл> [--yes]  — вернуть снимок data/milvus"
-        echo "  milvus-snapshot [файл]      — точный снимок data/milvus (Milvus останавливается на время копирования)"
+        echo "  milvus-snapshot [файл]      — точный снимок data/milvus (Milvus и etcd останавливаются на время копирования)"
         exit 1
         ;;
 esac

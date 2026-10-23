@@ -17,7 +17,8 @@ GReSym/
 |--------|---------|----------------------------------|--------|
 | `mariadb` (11.8) | по умолчанию | 3306 | `data/mariadb` |
 | `rabbitmq` (4.2 + management) | по умолчанию | 5672, 15672 | `data/rabbitmq` |
-| `milvus` (v3.0.2 standalone, встроенный etcd) | по умолчанию | 19530, 9091 | `data/milvus` |
+| `etcd` (v3.5.33, метаданные Milvus) | по умолчанию | — | `data/milvus/etcd` |
+| `milvus` (v3.0.2 standalone) | по умолчанию | 19530, 9091 | `data/milvus` |
 | `api` (`backend/Dockerfile`) | `app` | 5147 | — |
 | `ml-api` (`ml/Dockerfile`) | `app` | 8000 | — |
 | `ml-worker` (тот же образ) | `app` | — | — |
@@ -71,7 +72,8 @@ GReSym/
   на другую машину и для обновления Milvus. Восстановление (`restore milvus`) создаёт коллекцию заново и загружает векторы без модели.
 - `milvus-snapshot`: точная копия `data/milvus` (tar.zst). Milvus на время копирования останавливается. Подходит только для той же версии Milvus.
 
-Конфигурация Milvus — `milvus/embedEtcd.yaml` и `milvus/user.yaml` (переопределения `milvus.yaml`). После изменения: `docker compose restart milvus`.
+Конфигурация Milvus — `milvus/user.yaml` (переопределения `milvus.yaml`). После изменения: `docker compose restart milvus`.
+etcd запускается отдельным сервисом (встроенный в Milvus etcd приводил к падениям при старте, подробности в `docs/docker.md`).
 
 ### GPU (ROCm / CUDA)
 

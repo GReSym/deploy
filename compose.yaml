@@ -84,7 +84,37 @@ services:
     volumes:
       - ./data/milvus:/var/lib/milvus
 
-  # Translation of run_embed() of the official standalone_embed.sh (Milvus v3.0.2, embedded etcd, local storage)
+  # Milvus metadata store. Not embedded in Milvus (as in the official standalone_embed.sh) since 2026-10-24: embedded etcd
+  # serves before it has elected itself leader, Milvus' first read fails with "etcdserver: leader changed" and Milvus
+  # panics, often enough to crash-loop. Same etcd version and data dir (data/milvus/etcd) as the embedded one had.
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.33
+    restart: unless-stopped
+    user: "999:999"  # the milvus user of the Milvus image, owner of data/milvus (see milvus-init)
+    command: ["etcd"]
+    environment:
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    volumes:
+      - ./data/milvus:/var/lib/milvus
+    healthcheck:
+      # healthy = has a leader, so Milvus never sees the election
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    depends_on:
+      milvus-init:
+        condition: service_completed_successfully
+
+  # Translation of run_embed() of the official standalone_embed.sh (Milvus v3.0.2, local storage), but with external etcd
   milvus:
     image: milvusdb/milvus:v3.0.2
     restart: unless-stopped
@@ -92,14 +122,11 @@ services:
     security_opt:
       - seccomp:unconfined
     environment:
-      ETCD_USE_EMBED: "true"
-      ETCD_DATA_DIR: /var/lib/milvus/etcd
-      ETCD_CONFIG_PATH: /milvus/configs/embedEtcd.yaml
+      ETCD_ENDPOINTS: etcd:2379
       COMMON_STORAGETYPE: local
       DEPLOY_MODE: STANDALONE
     volumes:
       - ./data/milvus:/var/lib/milvus
-      - ./milvus/embedEtcd.yaml:/milvus/configs/embedEtcd.yaml:ro
       - ./milvus/user.yaml:/milvus/configs/user.yaml:ro
     ports:
       - "127.0.0.1:19530:19530"
@@ -114,6 +141,8 @@ services:
     depends_on:
       milvus-init:
         condition: service_completed_successfully
+      etcd:
+        condition: service_healthy
 
   api:
     profiles: [app]
@@ -158,10 +187,12 @@ services:
       GRESYM_ML__RABBITMQ__USER: ${RABBITMQ_USER}
       GRESYM_ML__RABBITMQ__PASSWORD: ${RABBITMQ_PASSWORD}
       GRESYM_ML__MODEL__PATH: /models/Qwen3-Embedding
+      GRESYM_ML__MODEL__ONNX_PATH: /models/Qwen3-Embedding-onnx
       # inside the container; the host port below stays on 127.0.0.1 (the ML API has no auth)
       GRESYM_ML__API__HOST: 0.0.0.0
     volumes: &ml-volumes
       - ../ml/Qwen3-Embedding:/models/Qwen3-Embedding:ro
+      - ../ml/Qwen3-Embedding-onnx:/models/Qwen3-Embedding-onnx:ro
       - ./backups:/backups
     ports:
       - "127.0.0.1:8000:8000"

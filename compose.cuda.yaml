@@ -10,5 +10,6 @@ services:
               count: all
               capabilities: [gpu]
     environment:
+      GRESYM_ML__MODEL__BACKEND: torch  # the ONNX backend is CPU-only
       GRESYM_ML__MODEL__DEVICE: cuda
       GRESYM_ML__MODEL__DTYPE: ${ML_MODEL_DTYPE:-bfloat16}
