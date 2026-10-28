@@ -81,7 +81,7 @@ etcd запускается отдельным сервисом (встроен�
 
 ```bash
 TORCH_BACKEND=rocm ./manage.sh setup    # или cuda; обратно: TORCH_BACKEND=cpu
-./manage.sh up --app                    # пересоберёт образ ML с torch из nightly-индекса PyTorch
+./manage.sh up --app                    # пересоберёт образ ML с torch из индекса PyTorch для ROCm/CUDA (rocm7.14 / cu132)
 ./manage.sh logs ml-worker              # в строке "Loading ... on cuda" видно, что модель на GPU
 ```
 
@@ -94,6 +94,8 @@ GPU получает только `ml-worker` (`compose.rocm.yaml` / `compose.cu
 - CUDA: нужны драйвер NVIDIA и `nvidia-container-toolkit` (`sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`).
 - Тип данных модели на GPU — `ML_MODEL_DTYPE` в `.env` (`bfloat16` по умолчанию; для старых видеокарт `float16` или `float32`).
 - Другой индекс PyTorch: `TORCH_INDEX_URL=... TORCH_BACKEND=rocm ./manage.sh setup`.
+  Индекс по умолчанию (`rocm7.14` / `cu132`) версионный и меняется с релизами torch/ROCm — при обновлении torch
+  сверьте URL с https://download.pytorch.org/whl/ и поправьте `TORCH_INDEXES` в `manage.sh`.
 
 ### RabbitMQ
 
