@@ -12,9 +12,11 @@ ENV_FILE=".env"
 BACKEND_CONFIG="../backend/config.json"
 ML_CONFIG="../ml/config.json"
 BACKUPS_DIR="backups"
-DATA_DIRS=("data/mariadb" "data/rabbitmq" "data/milvus")
+DATA_DIRS=("data/mariadb" "data/rabbitmq" "data/milvus" "data/openinary/public" "data/openinary/cache" "data/openinary/db")
 PLACEHOLDERS=("" "null" "xxx" "###")
 MILVUS_IMAGE="milvusdb/milvus:v3.0.2"
+# Тот же образ, что у сервиса openinary в compose.yaml (tar для backup/restore openinary)
+OPENINARY_IMAGE="openinary/openinary:v0.5.0@sha256:4965e429ce5ce12ef014826940aa7d83623bf266ad401fe6dd5b8371cbd5c42a"
 
 command -v docker >/dev/null || { echo "docker не установлен"; exit 1; }
 command -v jq >/dev/null || { echo "jq не установлен"; exit 1; }
@@ -87,6 +89,9 @@ setup() {
     values[RABBITMQ_PASSWORD]=$(jq -r '.rabbitmq_password // empty' "$BACKEND_CONFIG")
     values[JWT_KEY]=$(jq -r '.jwt_key // empty' "$BACKEND_CONFIG")
     values[JWT_EXPIRE_MINUTES]=$(jq -r '.jwt_expire_minutes // 60' "$BACKEND_CONFIG")
+    # Необязателен: ключ API, созданный в дашборде Openinary (http://localhost:3000 → API Keys), для миграции картинок
+    values[OPENINARY_API_KEY]=$(jq -r '.openinary_api_key // empty' "$BACKEND_CONFIG")
+    is_placeholder "${values[OPENINARY_API_KEY]}" && values[OPENINARY_API_KEY]=""
     values[DB_READONLY_USER]=$(jq -r '.database.user // empty' "$ML_CONFIG")
     values[DB_READONLY_PASSWORD]=$(jq -r '.database.password // empty' "$ML_CONFIG")
 
@@ -97,6 +102,17 @@ setup() {
         values[MARIADB_ROOT_PASSWORD]=$(openssl rand -hex 24)
         echo "Сгенерирован пароль root для MariaDB"
     fi
+
+    # Секреты Openinary тоже генерируются один раз: смена BETTER_AUTH_SECRET разлогинивает дашборд,
+    # смена API_SECRET делает недействительными подписанные URL
+    for key in OPENINARY_AUTH_SECRET OPENINARY_API_SECRET; do
+        values[$key]=$(env_value "$key")
+        if is_placeholder "${values[$key]}"; then
+            command -v openssl >/dev/null || { echo "openssl не установлен"; exit 1; }
+            values[$key]=$(openssl rand -hex 32)
+            echo "Сгенерирован $key"
+        fi
+    done
 
     local missing=() key
     for key in DB_NAME DB_PORT DB_USER DB_PASSWORD RABBITMQ_USER RABBITMQ_PASSWORD JWT_KEY DB_READONLY_USER DB_READONLY_PASSWORD; do
@@ -147,7 +163,8 @@ setup() {
 
     local order=(MARIADB_ROOT_PASSWORD DB_NAME DB_PORT DB_USER DB_PASSWORD DB_READONLY_USER DB_READONLY_PASSWORD
                  RABBITMQ_USER RABBITMQ_PASSWORD JWT_KEY JWT_EXPIRE_MINUTES API_DB_CONNECTION
-                 TORCH_BACKEND TORCH_INDEX_URL ML_MODEL_DTYPE VIDEO_GID RENDER_GID)
+                 TORCH_BACKEND TORCH_INDEX_URL ML_MODEL_DTYPE VIDEO_GID RENDER_GID
+                 OPENINARY_AUTH_SECRET OPENINARY_API_SECRET OPENINARY_API_KEY)
     for key in "${order[@]}"; do
         if [[ "${values[$key]}" == *"'"* || "${values[$key]}" == *$'\n'* ]]; then
             echo "Ошибка: значение $key содержит одинарную кавычку или перевод строки, в .env так нельзя"
@@ -236,6 +253,70 @@ backup_milvus() {
     run_ml export --out "$target"
 }
 
+# Оригиналы и auth.db Openinary (кэш вариантов не нужен, он пересобирается). Файлы принадлежат root контейнера,
+# поэтому tar запускается внутри образа Openinary. Openinary на время копирования останавливается (SQLite)
+backup_openinary() {
+    local target="$1"
+    require_docker
+    [[ -e "$target" ]] && { echo "Ошибка: $target уже существует"; return 1; }
+    [[ -d data/openinary/public ]] || { echo "Ошибка: data/openinary не найден"; return 1; }
+    mkdir -p "$(dirname "$target")"
+    echo "Останавливаем Openinary"
+    compose stop media openinary || return 1
+    local status=0
+    # Картинки уже сжаты, поэтому tar без сжатия
+    if docker run --rm --user 0:0 --network none --entrypoint tar \
+            -v "$DEPLOY_DIR/data/openinary:/src:ro" "$OPENINARY_IMAGE" \
+            --numeric-owner -C /src -cf - public db > "$target"; then
+        echo "Openinary: $target ($(du -h "$target" | cut -f1))"
+    else
+        rm -f "$target"
+        echo "Ошибка при копировании data/openinary"
+        status=1
+    fi
+    echo "Запускаем Openinary"
+    compose up -d --wait openinary media
+    return $status
+}
+
+restore_openinary() {
+    local file="$1" assume_yes="$2"
+    require_docker
+    if [[ "$assume_yes" != "--yes" ]]; then
+        echo "Текущие data/openinary/public, db и cache будут удалены и заменены архивом $file."
+        echo "Пути в БД (games.header_image_url, screenshots.url) должны соответствовать архиву: восстанавливайте вместе с дампом MariaDB."
+        read -r -p "Продолжить? [y/N] " answer
+        [[ "$answer" =~ ^[YyДд]$ ]] || { echo "Отменено"; exit 1; }
+    fi
+    prepare_dirs
+    echo "Останавливаем Openinary"
+    compose stop media openinary || exit 1
+    if docker run --rm -i --user 0:0 --network none --entrypoint /bin/sh \
+            -v "$DEPLOY_DIR/data/openinary:/dst" "$OPENINARY_IMAGE" \
+            -c 'find /dst/public /dst/db /dst/cache -mindepth 1 -delete && tar --numeric-owner -C /dst -xpf -' < "$file"; then
+        echo "Openinary восстановлен"
+    else
+        echo "Ошибка при восстановлении Openinary"
+        exit 1
+    fi
+    compose up -d --wait openinary media
+}
+
+# Better Auth (внутри Openinary v0.5.0) ограничивает каждый API-ключ 100 запросами в минуту, и окно сбрасывается
+# только после минуты без запросов: долгая миграция картинок упирается в него навсегда (ответ 401 «invalid key»).
+# Переменной окружения для этого нет, а PATCH /api-keys не меняет такие поля («server-only»), поэтому лимит снимается
+# прямо в auth.db. NULL в окне/максимуме — ветка «skip» независимо от того, как читается boolean. Перезапуск не нужен
+openinary_unlimit_keys() {
+    require_docker
+    compose exec -T openinary sh -c 'cd /app/packages/shared && node -' <<'JS'
+const Database = require("better-sqlite3");
+const db = new Database(process.env.DB_PATH || "/app/data/auth.db");
+const r = db.prepare("UPDATE apiKey SET rateLimitEnabled = 0, rateLimitTimeWindow = NULL, rateLimitMax = NULL, requestCount = 0").run();
+console.log(`Лимит запросов снят для ключей: ${r.changes}`);
+for (const k of db.prepare("SELECT name, start FROM apiKey").all()) console.log(`  ${k.name ?? "(без имени)"}  ${k.start ?? ""}…`);
+JS
+}
+
 backup() {
     local what="${1:-all}"
     local dir
@@ -244,19 +325,21 @@ backup() {
     case "$what" in
         mariadb) backup_mariadb "$dir" || exit 1 ;;
         milvus) backup_milvus "$dir" || exit 1 ;;
+        openinary) backup_openinary "$dir/openinary.tar" || exit 1 ;;
         all)
             backup_mariadb "$dir" || exit 1
             # Коллекции может ещё не быть (векторы не построены): это не повод терять дамп MariaDB
             backup_milvus "$dir" || echo "Внимание: векторы Milvus не сохранены (см. сообщение выше)"
+            backup_openinary "$dir/openinary.tar" || echo "Внимание: Openinary не сохранён (см. сообщение выше)"
             ;;
-        *) echo "Использование: ./manage.sh backup [mariadb|milvus|all]"; exit 1 ;;
+        *) echo "Использование: ./manage.sh backup [mariadb|milvus|openinary|all]"; exit 1 ;;
     esac
     echo "Резервная копия: $dir"
 }
 
 restore() {
     local what="$1" file="$2" assume_yes="$3"
-    [[ -n "$file" ]] || { echo "Использование: ./manage.sh restore {mariadb|milvus|milvus-snapshot} <файл> [--yes]"; exit 1; }
+    [[ -n "$file" ]] || { echo "Использование: ./manage.sh restore {mariadb|milvus|milvus-snapshot|openinary} <файл> [--yes]"; exit 1; }
     [[ -f "$file" ]] || { echo "Ошибка: файл $file не найден"; exit 1; }
     case "$what" in
         mariadb)
@@ -271,8 +354,11 @@ restore() {
         milvus-snapshot)
             milvus_snapshot_restore "$file" "$assume_yes"
             ;;
+        openinary)
+            restore_openinary "$file" "$assume_yes"
+            ;;
         *)
-            echo "Использование: ./manage.sh restore {mariadb|milvus|milvus-snapshot} <файл> [--yes]"
+            echo "Использование: ./manage.sh restore {mariadb|milvus|milvus-snapshot|openinary} <файл> [--yes]"
             exit 1
             ;;
     esac
@@ -333,18 +419,21 @@ case "${1:-}" in
     backup) backup "${2:-all}" ;;
     restore) restore "${2:-}" "${3:-}" "${4:-}" ;;
     milvus-snapshot) milvus_snapshot "${2:-}" ;;
+    openinary-unlimit-keys) openinary_unlimit_keys ;;
     *)
-        echo "Использование: $0 {setup|up|down|ps|logs|backup|restore|milvus-snapshot}"
+        echo "Использование: $0 {setup|up|down|ps|logs|backup|restore|milvus-snapshot|openinary-unlimit-keys}"
         echo "  setup                       — сгенерировать .env из ../backend/config.json и ../ml/config.json"
         echo "                                (TORCH_BACKEND=cpu|rocm|cuda ./manage.sh setup — сборка PyTorch для ML)"
-        echo "  up [--app]                  — запустить MariaDB, RabbitMQ, Milvus (--app: ещё API, ML API, ML worker)"
+        echo "  up [--app]                  — запустить MariaDB, RabbitMQ, Milvus, Openinary (--app: ещё API, ML API, ML worker)"
         echo "  down                        — остановить и удалить контейнеры (данные в data/ остаются)"
         echo "  ps | logs [сервис]          — состояние / логи"
-        echo "  backup [mariadb|milvus|all] — резервная копия в backups/<дата>/ (по умолчанию all)"
+        echo "  backup [mariadb|milvus|openinary|all] — резервная копия в backups/<дата>/ (по умолчанию all)"
         echo "  restore mariadb <файл> [--yes]          — восстановить MariaDB из дампа"
         echo "  restore milvus <файл.npz> [--yes]       — восстановить векторы из ml export"
         echo "  restore milvus-snapshot <файл> [--yes]  — вернуть снимок data/milvus"
+        echo "  restore openinary <файл.tar> [--yes]    — вернуть картинки и учётки Openinary (вместе с дампом MariaDB)"
         echo "  milvus-snapshot [файл]      — точный снимок data/milvus (Milvus и etcd останавливаются на время копирования)"
+        echo "  openinary-unlimit-keys      — снять лимит 100 запросов/мин с API-ключей Openinary (нужно для миграции картинок)"
         exit 1
         ;;
 esac

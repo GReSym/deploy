@@ -1,5 +1,5 @@
 # GReSym local stack. Run through ./manage.sh (it creates the data dirs and .env first).
-#   docker compose up -d                 → infrastructure only: MariaDB, RabbitMQ, Milvus
+#   docker compose up -d                 → infrastructure only: MariaDB, RabbitMQ, Milvus, Openinary (+ media gateway)
 #   docker compose --profile app up -d   → + API, ML API, ML worker
 # With TORCH_BACKEND=rocm|cuda in .env, manage.sh also loads compose.rocm.yaml / compose.cuda.yaml (GPU for ml-worker):
 # use ./manage.sh, or pass -f compose.yaml -f compose.<backend>.yaml to docker compose yourself.
@@ -144,6 +144,70 @@ services:
       etcd:
         condition: service_healthy
 
+  # Image CDN (https://github.com/openinary/openinary, pre-1.0: no backward compatibility between releases, so the
+  # image is pinned by tag AND digest; read its CHANGELOG.md before bumping). Full image = API + dashboard + nginx,
+  # the dashboard (http://localhost:${OPENINARY_PORT:-3000}) is for the admin only. Public traffic goes through "media".
+  # Originals are plain files in data/openinary/public/<path>, rendered variants in data/openinary/cache (rebuildable),
+  # accounts and API keys in data/openinary/db/auth.db. The processes run as root, so the files are root-owned.
+  openinary:
+    image: openinary/openinary:v0.5.0@sha256:4965e429ce5ce12ef014826940aa7d83623bf266ad401fe6dd5b8371cbd5c42a
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      MODE: fullstack
+      NEXT_PUBLIC_API_BASE_URL: /api
+      BETTER_AUTH_SECRET: ${OPENINARY_AUTH_SECRET:?run ./manage.sh setup}
+      BETTER_AUTH_URL: http://localhost:${OPENINARY_PORT:-3000}
+      BETTER_AUTH_INTERNAL_URL: http://127.0.0.1:3001
+      # Signs /authenticated/* URLs and presigned uploads (not used by GReSym yet)
+      API_SECRET: ${OPENINARY_API_SECRET:?run ./manage.sh setup}
+      IMAGE_TAG: v0.5.0
+      OPENINARY_TELEMETRY: "false"
+      MAX_FILE_SIZE_MB: "50"
+      # Per-IP limit on /t/* AND /upload. The media gateway does the public rate limiting, this one has to let a
+      # catalogue page (dozens of images) and the backend's bulk uploads through
+      PUBLIC_RATE_LIMIT_MAX: ${OPENINARY_RATE_LIMIT:-5000}
+    volumes:
+      - ./data/openinary/public:/app/apps/api/public
+      - ./data/openinary/cache:/app/apps/api/cache
+      - ./data/openinary/db:/app/data
+      - ./data/openinary/db:/app/web-standalone/data
+    ports:
+      - "127.0.0.1:${OPENINARY_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+      start_interval: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  # Public face of the CDN: only GET/HEAD of /t/<preset>/games/... (presets in media/presets.conf, the same strings as
+  # web-frontend/src/utils/media.ts) and of the originals. Openinary itself renders any transformation for anyone, so
+  # without this whitelist a visitor could fill the cache with w_1..w_4000 variants. This is the base URL to expose
+  # (tunnel / reverse proxy) and to set as the media base URL in the admin UI.
+  media:
+    image: nginx:1.30.5-alpine
+    restart: unless-stopped
+    volumes:
+      - ./media/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./media/presets.conf:/etc/nginx/presets.conf:ro
+    ports:
+      - "127.0.0.1:${MEDIA_PORT:-8090}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      openinary:
+        condition: service_healthy
+
   api:
     profiles: [app]
     build: ../backend
@@ -157,6 +221,10 @@ services:
       RabbitMq__User: ${RABBITMQ_USER}
       RabbitMq__Password: ${RABBITMQ_PASSWORD}
       Ml__BaseUrl: http://ml-api:8000
+      # Media store management API (uploads of the image migration) and the default public media base URL
+      Openinary__ApiUrl: http://openinary:3000/api
+      Openinary__ApiKey: ${OPENINARY_API_KEY:-###}
+      Media__DefaultBaseUrl: http://localhost:${MEDIA_PORT:-8090}
     ports:
       - "127.0.0.1:5147:8080"
     depends_on:

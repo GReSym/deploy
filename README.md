@@ -1,6 +1,6 @@
 # GReSym deploy
 
-Docker Compose окружение **GReSym**: MariaDB, RabbitMQ, Milvus и (по желанию) сами сервисы — API и ML.
+Docker Compose окружение **GReSym**: MariaDB, RabbitMQ, Milvus, Openinary (картинки) и (по желанию) сами сервисы — API и ML.
 
 Ожидаемая структура каталогов (репозитории рядом):
 
@@ -19,6 +19,8 @@ GReSym/
 | `rabbitmq` (4.2 + management) | по умолчанию | 5672, 15672 | `data/rabbitmq` |
 | `etcd` (v3.5.33, метаданные Milvus) | по умолчанию | — | `data/milvus/etcd` |
 | `milvus` (v3.0.2 standalone) | по умолчанию | 19530, 9091 | `data/milvus` |
+| `openinary` (v0.5.0, закреплён по digest) | по умолчанию | 3000 | `data/openinary/{public,cache,db}`; дашборд только для админа |
+| `media` (nginx, шлюз картинок) | по умолчанию | 8090 | `media/` — белый список пресетов; этот адрес выставлять наружу (см. docs/media.md) |
 | `api` (`backend/Dockerfile`) | `app` | 5147 | — |
 | `ml-api` (`ml/Dockerfile`) | `app` | 8000 | — |
 | `ml-worker` (тот же образ) | `app` | — | — |
@@ -52,11 +54,13 @@ GReSym/
 ```text
 ./manage.sh setup                               — сгенерировать .env
 ./manage.sh up [--app] | down | ps | logs [сервис]
-./manage.sh backup [mariadb|milvus|all]         — в backups/<дата>/
+./manage.sh backup [mariadb|milvus|openinary|all] — в backups/<дата>/
 ./manage.sh restore mariadb <файл> [--yes]
 ./manage.sh restore milvus <файл.npz> [--yes]
 ./manage.sh milvus-snapshot [файл]              — точный снимок data/milvus
 ./manage.sh restore milvus-snapshot <файл> [--yes]
+./manage.sh restore openinary <файл.tar> [--yes]
+./manage.sh openinary-unlimit-keys               — снять лимит 100 запросов/мин с API-ключей Openinary (после создания ключа)   — вместе с дампом MariaDB (в БД пути к картинкам)
 ```
 
 ### MariaDB
