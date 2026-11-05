@@ -317,8 +317,61 @@ for (const k of db.prepare("SELECT name, start FROM apiKey").all()) console.log(
 JS
 }
 
+# Только игры диапазона id (новые игры → другая машина без затрагивания её пользователей), см. docs/docker.md
+# backups/<дата>-games-N-M/: games.sql.zst (backend database dump-games), milvus.npz (ml export --from/--to), range
+backup_games() {
+    local from=1 to=2147483647
+    while (( $# )); do
+        case "$1" in
+            --from) from="${2:-}"; shift; shift ;;
+            --to) to="${2:-}"; shift; shift ;;
+            *) echo "Использование: ./manage.sh backup games [--from N] [--to M]"; exit 1 ;;
+        esac
+    done
+    if ! [[ "$from" =~ ^[0-9]+$ && "$to" =~ ^[0-9]+$ ]] || (( from > to )); then
+        echo "Ошибка: --from/--to должны быть числами, from ≤ to"
+        exit 1
+    fi
+    local dir="$BACKUPS_DIR/$(date +%Y%m%dT%H%M)-games-$from-$to"
+    mkdir -p "$dir"
+    local ext="sql.gz"
+    command -v zstd >/dev/null && ext="sql.zst"
+    if ! ../backend/manage.sh database dump-games --from "$from" --to "$to" "$DEPLOY_DIR/$dir/games.$ext"; then
+        rm -rf "$dir"
+        exit 1
+    fi
+    echo "$from $to" > "$dir/range"
+    local target
+    target=$(ml_path "$dir/milvus.npz") || exit 1
+    if ! run_ml export --from "$from" --to "$to" --out "$target"; then
+        echo "Внимание: векторы не сохранены (игры не векторизованы? uv run ml vectorize --ids ... / ml stale --reason missing)"
+    fi
+    echo "Готово: $dir — скопируйте папку в deploy/backups/ на другой машине и запустите ./manage.sh restore games $dir"
+}
+
+restore_games() {
+    local dir="${1%/}" assume_yes="$2"
+    [[ -n "$dir" ]] || { echo "Использование: ./manage.sh restore games <папка backup games> [--yes]"; exit 1; }
+    [[ -f "$dir/range" ]] || { echo "Ошибка: $dir — не папка backup games (нет файла range)"; exit 1; }
+    local dump from to
+    dump=$(find "$dir" -maxdepth 1 -name 'games.sql*' | head -n 1)
+    [[ -n "$dump" ]] || { echo "Ошибка: в $dir нет games.sql*"; exit 1; }
+    read -r from to < "$dir/range"
+    ../backend/manage.sh database restore-games "$(readlink -f "$dump")" "$assume_yes" || exit 1
+    if [[ -f "$dir/milvus.npz" ]]; then
+        local source
+        source=$(ml_path "$dir/milvus.npz") || exit 1
+        run_ml import "$source" || { echo "Ошибка при импорте векторов (MariaDB уже обновлена, можно повторить)"; exit 1; }
+    else
+        echo "Внимание: в $dir нет milvus.npz, векторы не импортированы (рекомендации эти игры не увидят)"
+    fi
+    run_ml index-text --from "$from" --to "$to" --skip-existing || { echo "Ошибка при обновлении поискового индекса"; exit 1; }
+    echo "Готово: игры $from..$to перенесены"
+}
+
 backup() {
     local what="${1:-all}"
+    [[ "$what" == "games" ]] && { shift; backup_games "$@"; return; }
     local dir
     dir="$BACKUPS_DIR/$(date +%Y%m%dT%H%M)"
     mkdir -p "$dir"
@@ -332,13 +385,14 @@ backup() {
             backup_milvus "$dir" || echo "Внимание: векторы Milvus не сохранены (см. сообщение выше)"
             backup_openinary "$dir/openinary.tar" || echo "Внимание: Openinary не сохранён (см. сообщение выше)"
             ;;
-        *) echo "Использование: ./manage.sh backup [mariadb|milvus|openinary|all]"; exit 1 ;;
+        *) echo "Использование: ./manage.sh backup [mariadb|milvus|openinary|all] | backup games [--from N] [--to M]"; exit 1 ;;
     esac
     echo "Резервная копия: $dir"
 }
 
 restore() {
     local what="$1" file="$2" assume_yes="$3"
+    [[ "$what" == "games" ]] && { restore_games "$file" "$assume_yes"; return; }
     [[ -n "$file" ]] || { echo "Использование: ./manage.sh restore {mariadb|milvus|milvus-snapshot|openinary} <файл> [--yes]"; exit 1; }
     [[ -f "$file" ]] || { echo "Ошибка: файл $file не найден"; exit 1; }
     case "$what" in
@@ -416,7 +470,7 @@ case "${1:-}" in
     down) down ;;
     ps) require_docker; compose --profile app ps ;;
     logs) require_docker; shift; compose --profile app logs -f --tail 200 "$@" ;;
-    backup) backup "${2:-all}" ;;
+    backup) backup "${2:-all}" "${@:3}" ;;
     restore) restore "${2:-}" "${3:-}" "${4:-}" ;;
     milvus-snapshot) milvus_snapshot "${2:-}" ;;
     openinary-unlimit-keys) openinary_unlimit_keys ;;
@@ -428,7 +482,9 @@ case "${1:-}" in
         echo "  down                        — остановить и удалить контейнеры (данные в data/ остаются)"
         echo "  ps | logs [сервис]          — состояние / логи"
         echo "  backup [mariadb|milvus|openinary|all] — резервная копия в backups/<дата>/ (по умолчанию all)"
+        echo "  backup games [--from N] [--to M]       — только игры диапазона id (+ их векторы) в backups/<дата>-games-N-M/"
         echo "  restore mariadb <файл> [--yes]          — восстановить MariaDB из дампа"
+        echo "  restore games <папка> [--yes]           — влить игры из backup games (пользователи не трогаются) + векторы + поиск"
         echo "  restore milvus <файл.npz> [--yes]       — восстановить векторы из ml export"
         echo "  restore milvus-snapshot <файл> [--yes]  — вернуть снимок data/milvus"
         echo "  restore openinary <файл.tar> [--yes]    — вернуть картинки и учётки Openinary (вместе с дампом MariaDB)"
