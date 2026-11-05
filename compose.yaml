@@ -237,10 +237,11 @@ services:
     profiles: [app]
     build:
       context: ../ml
+      dockerfile: Dockerfile
       args:
-        # cpu | rocm | cuda (deploy/.env). GPU access for ml-worker comes from compose.<backend>.yaml (added by manage.sh)
-        TORCH_BACKEND: ${TORCH_BACKEND:-cpu}
-        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-}
+        # Thin image: FROM gresym/ml-torch:${TORCH_BASE_TAG} — the heavy base (locked env + GPU torch) built by
+        # ./manage.sh build-torch (auto-built by `up --app` when missing). cpu | rocm | cuda comes from .env.
+        TORCH_BASE: gresym/ml-torch:${TORCH_BASE_TAG:?run ./manage.sh setup}
     image: gresym/ml
     restart: unless-stopped
     command: ["ml", "api"]

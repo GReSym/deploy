@@ -21,11 +21,23 @@ OPENINARY_IMAGE="openinary/openinary:v0.5.0@sha256:4965e429ce5ce12ef014826940aa7
 command -v docker >/dev/null || { echo "docker не установлен"; exit 1; }
 command -v jq >/dev/null || { echo "jq не установлен"; exit 1; }
 
-# Индексы PyTorch для TORCH_BACKEND (сборка образа ML). cpu берётся из uv.lock (индекс pytorch-cpu в ml/pyproject.toml)
+# Индексы PyTorch для TORCH_BACKEND (сборка базового образа ml-torch). cpu берётся из uv.lock (индекс pytorch-cpu в ml/pyproject.toml)
 declare -A TORCH_INDEXES=(
     [rocm]="https://download.pytorch.org/whl/rocm7.14"
     [cuda]="https://download.pytorch.org/whl/cu132"
 )
+# Версия GPU-torch по умолчанию, пинится в образе gresym/ml-torch (иначе uv молча ставит свежий релиз с индекса
+# и кэш слетает при каждом обновлении индекса). Актуальную версию смотреть на https://download.pytorch.org/whl/
+TORCH_DEFAULT_VERSION="2.14.1"
+
+# Тег базового образа ML (gresym/ml-torch:<тег>): cpu | rocm-<версия> | cuda-<версия>.
+# Для cpu torch приходит из uv.lock, поэтому версия в теге не нужна. Локальная часть (+rocm7.14) отбрасывается:
+# в теге docker допустимы только [a-zA-Z0-9_.-]
+torch_base_tag() {
+    local backend="$1" version="$2"
+    [[ -z "$backend" || "$backend" == "cpu" ]] && { echo "cpu"; return; }
+    echo "${backend}-${version%%+*}"
+}
 
 # docker compose с GPU-оверлеем для TORCH_BACKEND=rocm|cuda (compose.rocm.yaml / compose.cuda.yaml).
 # Явный -f отключает автозагрузку compose.override.yaml, поэтому он добавляется вручную
@@ -134,14 +146,22 @@ setup() {
         *) echo "Ошибка: TORCH_BACKEND=${values[TORCH_BACKEND]}, ожидается cpu, rocm или cuda"; exit 1 ;;
     esac
     # Индекс можно переопределить (TORCH_INDEX_URL=... ./manage.sh setup), пока backend не меняется
-    local previous_backend
+    local previous_backend previous_torch_version
     previous_backend=$(env_value TORCH_BACKEND)
+    previous_torch_version=$(env_value TORCH_VERSION)
     values[TORCH_INDEX_URL]="${TORCH_INDEX_URL:-}"
     if [[ -z "${values[TORCH_INDEX_URL]}" && "$previous_backend" == "${values[TORCH_BACKEND]}" ]]; then
         values[TORCH_INDEX_URL]=$(env_value TORCH_INDEX_URL)
     fi
     [[ "${values[TORCH_BACKEND]}" == "cpu" ]] && values[TORCH_INDEX_URL]=""
     [[ "${values[TORCH_BACKEND]}" != "cpu" && -z "${values[TORCH_INDEX_URL]}" ]] && values[TORCH_INDEX_URL]="${TORCH_INDEXES[${values[TORCH_BACKEND]}]}"
+    # Пин версии GPU-torch (для cpu torch берётся из uv.lock, версия не нужна). TORCH_VERSION=... ./manage.sh setup
+    # переопределяет, иначе — прежнее значение из .env или TORCH_DEFAULT_VERSION
+    values[TORCH_VERSION]="${TORCH_VERSION:-$previous_torch_version}"
+    [[ "${values[TORCH_BACKEND]}" == "cpu" ]] && values[TORCH_VERSION]=""
+    [[ "${values[TORCH_BACKEND]}" != "cpu" ]] && values[TORCH_VERSION]="${values[TORCH_VERSION]:-$TORCH_DEFAULT_VERSION}"
+    # Тег базового образа gresym/ml-torch, от которого собирается gresym/ml (FROM в ml/Dockerfile)
+    values[TORCH_BASE_TAG]=$(torch_base_tag "${values[TORCH_BACKEND]}" "${values[TORCH_VERSION]}")
     values[ML_MODEL_DTYPE]="${ML_MODEL_DTYPE:-$(env_value ML_MODEL_DTYPE)}"
     values[ML_MODEL_DTYPE]="${values[ML_MODEL_DTYPE]:-bfloat16}"
     # ROCm: контейнеру нужны группы video и render хоста (доступ к /dev/kfd и /dev/dri)
@@ -155,15 +175,18 @@ setup() {
         [[ -e /dev/kfd ]] || echo "Внимание: /dev/kfd не найден, драйвер amdgpu не загружен?"
     fi
     if [[ "${values[TORCH_BACKEND]}" != "$previous_backend" && -n "$previous_backend" ]]; then
-        echo "TORCH_BACKEND: $previous_backend → ${values[TORCH_BACKEND]}. Пересоберите образ ML: ./manage.sh up --app"
+        echo "TORCH_BACKEND: $previous_backend → ${values[TORCH_BACKEND]}. Базовый образ пересоберётся при следующем ./manage.sh up --app"
     fi
-    echo "PyTorch: ${values[TORCH_BACKEND]}${values[TORCH_INDEX_URL]:+ (${values[TORCH_INDEX_URL]})}"
+    if [[ -n "${values[TORCH_VERSION]}" && -n "$previous_torch_version" && "${values[TORCH_VERSION]}" != "$previous_torch_version" ]]; then
+        echo "TORCH_VERSION: $previous_torch_version → ${values[TORCH_VERSION]}. Пересоберите базовый образ: ./manage.sh build-torch"
+    fi
+    echo "PyTorch: ${values[TORCH_BACKEND]}${values[TORCH_VERSION]:+-${values[TORCH_VERSION]}}${values[TORCH_INDEX_URL]:+ (${values[TORCH_INDEX_URL]})}"
 
     values[API_DB_CONNECTION]="Server=mariadb;Port=3306;Database=${values[DB_NAME]};User=$(quote_conn_value "${values[DB_USER]}");Password=$(quote_conn_value "${values[DB_PASSWORD]}");"
 
     local order=(MARIADB_ROOT_PASSWORD DB_NAME DB_PORT DB_USER DB_PASSWORD DB_READONLY_USER DB_READONLY_PASSWORD
                  RABBITMQ_USER RABBITMQ_PASSWORD JWT_KEY JWT_EXPIRE_MINUTES API_DB_CONNECTION
-                 TORCH_BACKEND TORCH_INDEX_URL ML_MODEL_DTYPE VIDEO_GID RENDER_GID
+                 TORCH_BACKEND TORCH_INDEX_URL TORCH_VERSION TORCH_BASE_TAG ML_MODEL_DTYPE VIDEO_GID RENDER_GID
                  OPENINARY_AUTH_SECRET OPENINARY_API_SECRET OPENINARY_API_KEY)
     for key in "${order[@]}"; do
         if [[ "${values[$key]}" == *"'"* || "${values[$key]}" == *$'\n'* ]]; then
@@ -189,12 +212,46 @@ prepare_dirs() {
     mkdir -p "${DATA_DIRS[@]}" "$BACKUPS_DIR"
 }
 
+# Базовый образ ML (gresym/ml-torch:<тег>): python + окружение из uv.lock + apt-библиотеки + GPU-torch.
+# Тяжёлая часть (~18 ГБ для ROCm), собирается редко: смена TORCH_VERSION/TORCH_INDEX_URL или uv.lock.
+# Тегированный образ переживает docker builder prune / GC, поэтому пересборка gresym/ml по коду
+# никогда не качает torch заново
+build_torch() {
+    require_docker
+    require_env
+    local backend index version tag
+    backend=$(env_value TORCH_BACKEND)
+    backend="${backend:-cpu}"
+    index=$(env_value TORCH_INDEX_URL)
+    version=$(env_value TORCH_VERSION)
+    tag=$(torch_base_tag "$backend" "$version")
+    echo "Сборка gresym/ml-torch:$tag (backend=$backend, torch=${version:-из uv.lock})"
+    docker build -f ../ml/Dockerfile.torch \
+        --build-arg TORCH_BACKEND="$backend" \
+        --build-arg TORCH_INDEX_URL="$index" \
+        --build-arg TORCH_VERSION="$version" \
+        -t "gresym/ml-torch:$tag" ../ml
+}
+
+# Сборка базового образа, если его ещё нет (вызывается из up --app)
+ensure_torch_base() {
+    local tag
+    tag=$(torch_base_tag "$(env_value TORCH_BACKEND)" "$(env_value TORCH_VERSION)")
+    if ! docker image inspect "gresym/ml-torch:$tag" >/dev/null 2>&1; then
+        echo "Базовый образ gresym/ml-torch:$tag не найден — собираем (GPU-сборка может занять десятки минут)"
+        build_torch || exit 1
+    fi
+}
+
 up() {
     require_docker
     require_env
     prepare_dirs
     local args=()
-    [[ "$1" == "--app" ]] && args+=(--profile app)
+    if [[ "$1" == "--app" ]]; then
+        args+=(--profile app)
+        ensure_torch_base
+    fi
     if [[ ! -e data/mariadb/mysql ]]; then
         local seed
         seed=$(ls -1t mariadb/seed/*.sql mariadb/seed/*.sql.gz mariadb/seed/*.sql.xz mariadb/seed/*.sql.zst 2>/dev/null | head -n 1)
@@ -467,6 +524,7 @@ milvus_snapshot_restore() {
 case "${1:-}" in
     setup) setup ;;
     up) up "${2:-}" ;;
+    build-torch) build_torch ;;
     down) down ;;
     ps) require_docker; compose --profile app ps ;;
     logs) require_docker; shift; compose --profile app logs -f --tail 200 "$@" ;;
@@ -475,10 +533,14 @@ case "${1:-}" in
     milvus-snapshot) milvus_snapshot "${2:-}" ;;
     openinary-unlimit-keys) openinary_unlimit_keys ;;
     *)
-        echo "Использование: $0 {setup|up|down|ps|logs|backup|restore|milvus-snapshot|openinary-unlimit-keys}"
+        echo "Использование: $0 {setup|up|build-torch|down|ps|logs|backup|restore|milvus-snapshot|openinary-unlimit-keys}"
         echo "  setup                       — сгенерировать .env из ../backend/config.json и ../ml/config.json"
-        echo "                                (TORCH_BACKEND=cpu|rocm|cuda ./manage.sh setup — сборка PyTorch для ML)"
-        echo "  up [--app]                  — запустить MariaDB, RabbitMQ, Milvus, Openinary (--app: ещё API, ML API, ML worker)"
+        echo "                                (TORCH_BACKEND=cpu|rocm|cuda ./manage.sh setup — сборка PyTorch для ML;"
+        echo "                                 TORCH_VERSION=<v> — пин версии GPU-torch)"
+        echo "  up [--app]                  — запустить MariaDB, RabbitMQ, Milvus, Openinary (--app: ещё API, ML API, ML worker;"
+        echo "                                недостающий базовый образ gresym/ml-torch собирается автоматически)"
+        echo "  build-torch                 — пересобрать базовый образ ML gresym/ml-torch (окружение uv.lock + GPU-torch):"
+        echo "                                нужен при смене TORCH_VERSION/TORCH_INDEX_URL или изменении uv.lock"
         echo "  down                        — остановить и удалить контейнеры (данные в data/ остаются)"
         echo "  ps | logs [сервис]          — состояние / логи"
         echo "  backup [mariadb|milvus|openinary|all] — резервная копия в backups/<дата>/ (по умолчанию all)"
