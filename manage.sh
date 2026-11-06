@@ -11,6 +11,7 @@ DEPLOY_DIR="$PWD"
 ENV_FILE=".env"
 BACKEND_CONFIG="../backend/config.json"
 ML_CONFIG="../ml/config.json"
+ML_CONFIG_EXAMPLE="../ml/config.example.json"
 BACKUPS_DIR="backups"
 DATA_DIRS=("data/mariadb" "data/rabbitmq" "data/milvus" "data/openinary/public" "data/openinary/cache" "data/openinary/db")
 PLACEHOLDERS=("" "null" "xxx" "###")
@@ -107,6 +108,39 @@ setup() {
     values[DB_READONLY_USER]=$(jq -r '.database.user // empty' "$ML_CONFIG")
     values[DB_READONLY_PASSWORD]=$(jq -r '.database.password // empty' "$ML_CONFIG")
 
+    # Match ml.config's deep merge: local config.json normally contains secrets/overrides only.
+    local ml_merged
+    ml_merged=$(mktemp)
+    jq -s 'def merge($base; $override):
+        reduce ($override | keys[]) as $key ($base;
+            .[$key] = if ($base[$key] | type) == "object" and ($override[$key] | type) == "object"
+                      then merge($base[$key]; $override[$key]) else $override[$key] end);
+        merge(.[0]; .[1])' "$ML_CONFIG_EXAMPLE" "$ML_CONFIG" > "$ml_merged" || exit 1
+
+    # Resolve configured model directories relative to ml/ (as ml.config does), then mount only the selected model.
+    local ml_root model_path onnx_path
+    ml_root=$(realpath "../ml")
+    model_path=$(jq -r '.model.path // empty' "$ml_merged")
+    onnx_path=$(jq -r '.model.onnx_path // empty' "$ml_merged")
+    [[ -n "$model_path" ]] || { echo "Ошибка: model.path не задан в $ML_CONFIG"; exit 1; }
+    [[ "$model_path" = /* ]] && model_path=$(realpath -m "$model_path") || model_path=$(realpath -m "$ml_root/$model_path")
+    [[ "$model_path" == "$ml_root"/* && -d "$model_path" ]] || {
+        echo "Ошибка: model.path должен указывать на существующий каталог внутри $ml_root"; exit 1;
+    }
+    if [[ -n "$onnx_path" ]]; then
+        [[ "$onnx_path" = /* ]] && onnx_path=$(realpath -m "$onnx_path") || onnx_path=$(realpath -m "$ml_root/$onnx_path")
+        [[ "$onnx_path" == "$ml_root"/* && -d "$onnx_path" ]] || {
+            echo "Ошибка: model.onnx_path должен указывать на существующий каталог внутри $ml_root"; exit 1;
+        }
+    fi
+    values[ML_MODEL_HOST_PATH]="$model_path"
+    values[ML_ONNX_HOST_PATH]="${onnx_path:-$model_path}"
+    values[ML_MODEL_BACKEND]=$(jq -r '.model.backend // "onnx"' "$ml_merged")
+    # Keep the merged runtime config in the ignored deploy dir; remove secrets and translate model paths to container paths.
+    jq 'del(.database, .rabbitmq, .steam) | .model.path = "/models/active" | .model.onnx_path = "/models/onnx"' \
+        "$ml_merged" > .ml-runtime.json || exit 1
+    rm -f "$ml_merged"
+
     # Пароль root генерируется один раз: MariaDB применяет его только при первой инициализации data/mariadb
     values[MARIADB_ROOT_PASSWORD]=$(env_value MARIADB_ROOT_PASSWORD)
     if is_placeholder "${values[MARIADB_ROOT_PASSWORD]}"; then
@@ -162,8 +196,7 @@ setup() {
     [[ "${values[TORCH_BACKEND]}" != "cpu" ]] && values[TORCH_VERSION]="${values[TORCH_VERSION]:-$TORCH_DEFAULT_VERSION}"
     # Тег базового образа gresym/ml-torch, от которого собирается gresym/ml (FROM в ml/Dockerfile)
     values[TORCH_BASE_TAG]=$(torch_base_tag "${values[TORCH_BACKEND]}" "${values[TORCH_VERSION]}")
-    values[ML_MODEL_DTYPE]="${ML_MODEL_DTYPE:-$(env_value ML_MODEL_DTYPE)}"
-    values[ML_MODEL_DTYPE]="${values[ML_MODEL_DTYPE]:-bfloat16}"
+    values[ML_MODEL_DTYPE]="${ML_MODEL_DTYPE:-$(jq -r '.model.dtype // "float32"' .ml-runtime.json)}"
     # ROCm: контейнеру нужны группы video и render хоста (доступ к /dev/kfd и /dev/dri)
     values[VIDEO_GID]=$(getent group video | cut -d: -f3)
     values[RENDER_GID]=$(getent group render | cut -d: -f3)
@@ -186,7 +219,8 @@ setup() {
 
     local order=(MARIADB_ROOT_PASSWORD DB_NAME DB_PORT DB_USER DB_PASSWORD DB_READONLY_USER DB_READONLY_PASSWORD
                  RABBITMQ_USER RABBITMQ_PASSWORD JWT_KEY JWT_EXPIRE_MINUTES API_DB_CONNECTION
-                 TORCH_BACKEND TORCH_INDEX_URL TORCH_VERSION TORCH_BASE_TAG ML_MODEL_DTYPE VIDEO_GID RENDER_GID
+                 TORCH_BACKEND TORCH_INDEX_URL TORCH_VERSION TORCH_BASE_TAG ML_MODEL_DTYPE
+                 ML_MODEL_HOST_PATH ML_ONNX_HOST_PATH ML_MODEL_BACKEND VIDEO_GID RENDER_GID
                  OPENINARY_AUTH_SECRET OPENINARY_API_SECRET OPENINARY_API_KEY)
     for key in "${order[@]}"; do
         if [[ "${values[$key]}" == *"'"* || "${values[$key]}" == *$'\n'* ]]; then

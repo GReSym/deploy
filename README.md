@@ -7,7 +7,7 @@ Docker Compose окружение **GReSym**: MariaDB, RabbitMQ, Milvus, Openina
 ```text
 GReSym/
 ├── backend/   # ASP.NET API (Dockerfile, manage.sh, config.json)
-├── ml/        # ML-сервис (Dockerfile, config.json, Qwen3-Embedding/)
+├── ml/        # ML-сервис (Dockerfile, config.json, models/)
 └── deploy/    # этот репозиторий
 ```
 

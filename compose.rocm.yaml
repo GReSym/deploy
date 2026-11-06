@@ -14,6 +14,6 @@ services:
     environment:
       GRESYM_ML__MODEL__BACKEND: torch  # the ONNX backend is CPU-only
       GRESYM_ML__MODEL__DEVICE: cuda  # ROCm builds of torch expose AMD GPUs through the cuda API
-      GRESYM_ML__MODEL__DTYPE: ${ML_MODEL_DTYPE:-bfloat16}
+      GRESYM_ML__MODEL__DTYPE: ${ML_MODEL_DTYPE:?run ./manage.sh setup}
 # A GPU that ROCm doesn't support officially may need HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0). Set it in
 # compose.override.yaml (services.ml-worker.environment), not here: an empty value breaks the ROCm runtime.

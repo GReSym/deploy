@@ -255,13 +255,15 @@ services:
       GRESYM_ML__RABBITMQ__HOST: rabbitmq
       GRESYM_ML__RABBITMQ__USER: ${RABBITMQ_USER}
       GRESYM_ML__RABBITMQ__PASSWORD: ${RABBITMQ_PASSWORD}
-      GRESYM_ML__MODEL__PATH: /models/Qwen3-Embedding
-      GRESYM_ML__MODEL__ONNX_PATH: /models/Qwen3-Embedding-onnx
+      GRESYM_ML__MODEL__BACKEND: ${ML_MODEL_BACKEND:?run ./manage.sh setup}
+      GRESYM_ML_CONFIG: /app/config.json
       # inside the container; the host port below stays on 127.0.0.1 (the ML API has no auth)
       GRESYM_ML__API__HOST: 0.0.0.0
     volumes: &ml-volumes
-      - ../ml/Qwen3-Embedding:/models/Qwen3-Embedding:ro
-      - ../ml/Qwen3-Embedding-onnx:/models/Qwen3-Embedding-onnx:ro
+      - ../ml/config.example.json:/app/config.example.json:ro
+      - ./.ml-runtime.json:/app/config.json:ro
+      - ${ML_MODEL_HOST_PATH:?run ./manage.sh setup}:/models/active:ro
+      - ${ML_ONNX_HOST_PATH:?run ./manage.sh setup}:/models/onnx:ro
       - ./backups:/backups
     ports:
       - "127.0.0.1:8000:8000"
