@@ -264,6 +264,8 @@ services:
       - ./.ml-runtime.json:/app/config.json:ro
       - ${ML_MODEL_HOST_PATH:?run ./manage.sh setup}:/models/active:ro
       - ${ML_ONNX_HOST_PATH:?run ./manage.sh setup}:/models/onnx:ro
+      # Frozen mean review vector of the rcenter fusions (reviews.mean_path, written by `ml recombine` / `ml import`)
+      - ../ml/models/fusion:/app/models/fusion
       - ./backups:/backups
     ports:
       - "127.0.0.1:8000:8000"
