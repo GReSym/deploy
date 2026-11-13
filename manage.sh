@@ -124,7 +124,7 @@ setup() {
     onnx_path=$(jq -r '.model.onnx_path // empty' "$ml_merged")
     [[ -n "$model_path" ]] || { echo "Ошибка: model.path не задан в $ML_CONFIG"; exit 1; }
     [[ "$model_path" = /* ]] && model_path=$(realpath -m "$model_path") || model_path=$(realpath -m "$ml_root/$model_path")
-    [[ "$model_path" == "$ml_root"/* && -d "$model_path" ]] || {
+    [[ "$model_path" == "$ml_root"/* ]] || {
         echo "Ошибка: model.path должен указывать на существующий каталог внутри $ml_root"; exit 1;
     }
     if [[ -n "$onnx_path" ]]; then
